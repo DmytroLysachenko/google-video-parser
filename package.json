@@ -1,0 +1,20 @@
+{
+  "name": "video-to-audio-fn",
+  "version": "1.0.0",
+  "description": "Convert Drive MP4 to MP3 using ffmpeg (Cloud Run function, Node 22)",
+  "main": "index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "start": "functions-framework --target=processVideo --port=8081"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@google-cloud/functions-framework": "^3.4.0",
+    "googleapis": "^135.0.0"
+  },
+  "devDependencies": {
+    "dotenv": "^17.2.3"
+  }
+}
