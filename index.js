@@ -12,6 +12,7 @@ const os = require("os");
 const isRunningInCloud = Boolean(
   process.env.K_SERVICE || process.env.FUNCTION_TARGET
 );
+
 if (!isRunningInCloud) {
   try {
     const dotenvPath = path.resolve(__dirname, ".env");
@@ -100,7 +101,10 @@ async function getDriveClientForUser(userEmail) {
 
   console.log("Creating JWT client for SA:", key.client_email);
 
-  const scopes = ["https://www.googleapis.com/auth/drive.readonly"];
+  const scopes = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.readonly",
+  ];
   const jwtClient = new google.auth.JWT(
     key.client_email,
     null,
@@ -160,6 +164,41 @@ function bufferToStream(buffer) {
   return stream;
 }
 
+function escapeDriveName(name) {
+  // Simple helper to escape single quotes for Drive queries
+  return name.replace(/'/g, "\\'");
+}
+
+async function findExistingMp3(drive, mp3Name, parents) {
+  const qParts = [
+    `name='${escapeDriveName(mp3Name)}'`,
+    "mimeType='audio/mpeg'",
+    "trashed=false",
+  ];
+
+  if (parents && parents.length > 0) {
+    const parentClause = parents.map((p) => `'${p}' in parents`).join(" or ");
+    qParts.push(`(${parentClause})`);
+  }
+
+  const q = qParts.join(" and ");
+  console.log("Searching for existing MP3 with query:", q);
+
+  const resp = await drive.files.list({
+    q,
+    fields: "files(id,name,parents,webViewLink,webContentLink)",
+    pageSize: 1,
+  });
+
+  const match = resp.data.files?.[0];
+  if (match) {
+    console.log("Found existing MP3:", match);
+  } else {
+    console.log("No existing MP3 found");
+  }
+  return match;
+}
+
 // --- HTTP FUNCTION ------------------------------------------------------------
 
 functions.http("processVideo", async (req, res) => {
@@ -208,6 +247,27 @@ functions.http("processVideo", async (req, res) => {
     const sourceName = metaResp.data.name || fileId;
     const sourceParents = metaResp.data.parents || [];
 
+    const mp3Name = sourceName.endsWith(".mp4")
+      ? sourceName.replace(/\.mp4$/i, ".mp3")
+      : `${sourceName}.mp3`;
+
+    // Early exit if the MP3 already exists
+    const existingMp3 = await findExistingMp3(drive, mp3Name, sourceParents);
+    if (existingMp3) {
+      console.log("Returning existing MP3 without reprocessing");
+      return res.status(200).json({
+        status: "ok",
+        actingUser: userEmail,
+        originalFile: {
+          id: fileId,
+          name: sourceName,
+          parents: sourceParents,
+        },
+        audioFile: existingMp3,
+        reused: true,
+      });
+    }
+
     // 2) Download video file
     console.log("Downloading file bytes for:", fileId);
     let downloadResp;
@@ -255,10 +315,6 @@ functions.http("processVideo", async (req, res) => {
     }
 
     // 6) Prepare metadata for upload
-    const mp3Name = sourceName.endsWith(".mp4")
-      ? sourceName.replace(/\.mp4$/i, ".mp3")
-      : `${sourceName}.mp3`;
-
     console.log("MP3 upload name:", mp3Name);
     console.log("Uploading into parents:", sourceParents);
 
