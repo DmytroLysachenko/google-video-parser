@@ -32,6 +32,35 @@ if (!isRunningInCloud) {
   }
 }
 
+function startDevMemoryLogger() {
+  const intervalMs = parseInt(process.env.MEMORY_LOG_INTERVAL_MS || "5000", 10);
+  if (Number.isNaN(intervalMs) || intervalMs <= 0) {
+    console.warn("Skipping memory logger: invalid interval", intervalMs);
+    return;
+  }
+
+  const log = () => {
+    const usage = process.memoryUsage();
+    console.log("DEV memory usage (MB):", {
+      rss: (usage.rss / 1024 / 1024).toFixed(1),
+      heapTotal: (usage.heapTotal / 1024 / 1024).toFixed(1),
+      heapUsed: (usage.heapUsed / 1024 / 1024).toFixed(1),
+      external: (usage.external / 1024 / 1024).toFixed(1),
+    });
+  };
+
+  console.log(
+    `Starting dev memory logger. Interval: ${intervalMs}ms (set MEMORY_LOG_INTERVAL_MS to adjust).`
+  );
+  const handle = setInterval(log, intervalMs);
+
+  process.on("exit", () => clearInterval(handle));
+}
+
+if (!isRunningInCloud) {
+  startDevMemoryLogger();
+}
+
 const TMP_DIR = os.tmpdir();
 const FFMPEG_PATH = ffmpegInstaller.path;
 
@@ -215,12 +244,64 @@ function sanitizeGcsObjectName(name) {
   return cleaned;
 }
 
+async function streamToFile(readableStream, targetPath) {
+  console.log("Streaming data to:", targetPath);
+  await new Promise((resolve, reject) => {
+    const dest = fs.createWriteStream(targetPath);
+    dest.on("finish", resolve);
+    dest.on("error", reject);
+    readableStream.on("error", reject);
+    readableStream.pipe(dest);
+  });
+}
+
+async function uploadFileToGcs(localPath, gcsFile, metadata) {
+  return new Promise((resolve, reject) => {
+    const readStream = fs.createReadStream(localPath);
+    const writeStream = gcsFile.createWriteStream({
+      resumable: false,
+      contentType: "audio/mpeg",
+      metadata,
+    });
+
+    readStream.on("error", reject);
+    writeStream.on("error", reject);
+    writeStream.on("finish", resolve);
+
+    readStream.pipe(writeStream);
+  });
+}
+
+const MAX_CONCURRENT_JOBS = parseInt(
+  process.env.MAX_CONCURRENT_JOBS || "1",
+  10
+);
+let activeJobs = 0;
+
+function tryAcquireJobSlot() {
+  if (activeJobs >= MAX_CONCURRENT_JOBS) {
+    return false;
+  }
+  activeJobs++;
+  console.log("Job slot acquired. Active jobs:", activeJobs);
+  return true;
+}
+
+function releaseJobSlot() {
+  if (activeJobs > 0) {
+    activeJobs--;
+  }
+  console.log("Job slot released. Active jobs:", activeJobs);
+}
+
 functions.http("processVideo", async (req, res) => {
   console.log("Received request:", {
     method: req.method,
     url: req.url,
     body: req.body,
   });
+
+  let jobAcquired = false;
 
   try {
     if (req.method !== "POST") {
@@ -238,6 +319,14 @@ functions.http("processVideo", async (req, res) => {
     if (!userEmail) {
       console.error("Missing userEmail");
       return res.status(400).json({ error: "userEmail is required" });
+    }
+
+    jobAcquired = tryAcquireJobSlot();
+    if (!jobAcquired) {
+      console.warn("All job slots are currently busy");
+      return res.status(429).json({
+        error: "Too many concurrent conversions. Please retry shortly.",
+      });
     }
 
     const drive = await getDriveClientForUser(userEmail);
@@ -302,53 +391,27 @@ functions.http("processVideo", async (req, res) => {
     try {
       downloadResp = await drive.files.get(
         { fileId, alt: "media" },
-        { responseType: "arraybuffer" }
+        { responseType: "stream" }
       );
     } catch (err) {
       console.error("Drive API Error (downloading file):", err);
       throw err;
     }
 
-    console.log("Downloaded", downloadResp.data?.byteLength, "bytes");
-
-    const videoBuffer = Buffer.from(downloadResp.data);
-
     const inputPath = path.join(TMP_DIR, `input-${fileId}.mp4`);
     const outputPath = path.join(TMP_DIR, `output-${fileId}.mp3`);
-    console.log("Writing MP4 to:", inputPath);
-
-    try {
-      await fsp.writeFile(inputPath, videoBuffer);
-      console.log("MP4 written successfully");
-    } catch (err) {
-      console.error("Error writing MP4 to /tmp:", err);
-      throw err;
-    }
+    await streamToFile(downloadResp.data, inputPath);
 
     console.log("Calling convertToMp3...");
     await convertToMp3(inputPath, outputPath);
     console.log("MP3 created:", outputPath);
 
-    console.log("Reading MP3 from:", outputPath);
-    let audioBuffer;
-    try {
-      audioBuffer = await fsp.readFile(outputPath);
-      console.log("MP3 read successfully:", audioBuffer.length, "bytes");
-    } catch (err) {
-      console.error("Error reading MP3:", err);
-      throw err;
-    }
-
     console.log("Uploading MP3 to Cloud Storage bucket:", bucketName);
     try {
-      await gcsFile.save(audioBuffer, {
-        resumable: false,
-        contentType: "audio/mpeg",
+      await uploadFileToGcs(outputPath, gcsFile, {
         metadata: {
-          metadata: {
-            sourceFileId: fileId,
-            sourceFileName: sourceName,
-          },
+          sourceFileId: fileId,
+          sourceFileName: sourceName,
         },
       });
       [gcsMetadata] = await gcsFile.getMetadata();
@@ -385,5 +448,9 @@ functions.http("processVideo", async (req, res) => {
       error: "Internal server error",
       details: err.message,
     });
+  } finally {
+    if (jobAcquired) {
+      releaseJobSlot();
+    }
   }
 });
