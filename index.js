@@ -1,13 +1,13 @@
-// index.js (with full console logging)
-const functions = require("@google-cloud/functions-framework");
-const { google } = require("googleapis");
 const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
-const { spawn } = require("child_process");
-const { Readable } = require("stream");
-const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 const os = require("os");
+const { spawn } = require("child_process");
+
+const functions = require("@google-cloud/functions-framework");
+const { google } = require("googleapis");
+const { Storage } = require("@google-cloud/storage");
+const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 
 const isRunningInCloud = Boolean(
   process.env.K_SERVICE || process.env.FUNCTION_TARGET
@@ -32,16 +32,17 @@ if (!isRunningInCloud) {
   }
 }
 
-const TMP_DIR = os.tmpdir(); // This works on Windows and Linux
-console.log("Using temp dir:", TMP_DIR);
-
-// Path to bundled ffmpeg binary (@ffmpeg-installer/ffmpeg)
+const TMP_DIR = os.tmpdir();
 const FFMPEG_PATH = ffmpegInstaller.path;
-console.log("FFMPEG binary path:", FFMPEG_PATH);
 
-// --- AUTH BUILDING ---------------------------------------------------------
+let cachedServiceAccountKey = null;
+let cachedStorageClient = null;
 
 async function loadServiceAccountKey() {
+  if (cachedServiceAccountKey) {
+    return cachedServiceAccountKey;
+  }
+
   if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
     console.log("Using GOOGLE_SERVICE_ACCOUNT_KEY env var.");
     const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY.trim();
@@ -60,7 +61,8 @@ async function loadServiceAccountKey() {
     let parseError;
     for (const candidate of candidates) {
       try {
-        return JSON.parse(candidate);
+        cachedServiceAccountKey = JSON.parse(candidate);
+        return cachedServiceAccountKey;
       } catch (err) {
         parseError = err;
       }
@@ -78,7 +80,8 @@ async function loadServiceAccountKey() {
     console.log("Reading service account key from file:", resolvedPath);
     try {
       const fileContents = await fsp.readFile(resolvedPath, "utf8");
-      return JSON.parse(fileContents);
+      cachedServiceAccountKey = JSON.parse(fileContents);
+      return cachedServiceAccountKey;
     } catch (err) {
       console.error(
         "Failed to read or parse GOOGLE_SERVICE_ACCOUNT_KEY_FILE:",
@@ -110,7 +113,7 @@ async function getDriveClientForUser(userEmail) {
     null,
     key.private_key,
     scopes,
-    userEmail // impersonate user
+    userEmail
   );
 
   console.log("Authorizing JWT client...");
@@ -123,7 +126,22 @@ async function getDriveClientForUser(userEmail) {
   return drive;
 }
 
-// --- FFMPEG CONVERSION ---------------------------------------------------------
+async function getStorageClient() {
+  if (cachedStorageClient) {
+    return cachedStorageClient;
+  }
+
+  const key = await loadServiceAccountKey();
+  cachedStorageClient = new Storage({
+    projectId: key.project_id,
+    credentials: {
+      client_email: key.client_email,
+      private_key: key.private_key,
+    },
+  });
+
+  return cachedStorageClient;
+}
 
 async function convertToMp3(inputPath, outputPath) {
   console.log("convertToMp3() start");
@@ -154,52 +172,48 @@ async function convertToMp3(inputPath, outputPath) {
   });
 }
 
-// --- UTIL ---------------------------------------------------------------------
-
-function bufferToStream(buffer) {
-  console.log("Converting Buffer to Readable stream...");
-  const stream = new Readable();
-  stream.push(buffer);
-  stream.push(null);
-  return stream;
+function encodeGcsObjectPath(objectName) {
+  return objectName
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 }
 
-function escapeDriveName(name) {
-  // Simple helper to escape single quotes for Drive queries
-  return name.replace(/'/g, "\\'");
+function buildGcsAudioResponse(bucketName, objectName, metadata = {}) {
+  const encodedPath = encodeGcsObjectPath(objectName);
+  const publicUrl = `https://storage.googleapis.com/${bucketName}/${encodedPath}`;
+
+  return {
+    bucket: bucketName,
+    object: objectName,
+    gcsUri: `gs://${bucketName}/${objectName}`,
+    publicUrl,
+    size: metadata.size,
+    contentType: metadata.contentType,
+    mediaLink: metadata.mediaLink,
+    selfLink: metadata.selfLink,
+    updated: metadata.updated,
+    metadata: metadata.metadata,
+  };
 }
 
-async function findExistingMp3(drive, mp3Name, parents) {
-  const qParts = [
-    `name='${escapeDriveName(mp3Name)}'`,
-    "mimeType='audio/mpeg'",
-    "trashed=false",
-  ];
-
-  if (parents && parents.length > 0) {
-    const parentClause = parents.map((p) => `'${p}' in parents`).join(" or ");
-    qParts.push(`(${parentClause})`);
+function sanitizeGcsObjectName(name) {
+  if (!name) {
+    return `audio_${Date.now()}.mp3`;
   }
 
-  const q = qParts.join(" and ");
-  console.log("Searching for existing MP3 with query:", q);
+  const cleaned = name
+    .trim()
+    .replace(/[\\/]+/g, "_")
+    .replace(/-/g, "_")
+    .replace(/\s+/g, "_");
 
-  const resp = await drive.files.list({
-    q,
-    fields: "files(id,name,parents,webViewLink,webContentLink)",
-    pageSize: 1,
-  });
-
-  const match = resp.data.files?.[0];
-  if (match) {
-    console.log("Found existing MP3:", match);
-  } else {
-    console.log("No existing MP3 found");
+  if (!cleaned.toLowerCase().endsWith(".mp3")) {
+    return `${cleaned}.mp3`;
   }
-  return match;
-}
 
-// --- HTTP FUNCTION ------------------------------------------------------------
+  return cleaned;
+}
 
 functions.http("processVideo", async (req, res) => {
   console.log("Received request:", {
@@ -226,10 +240,8 @@ functions.http("processVideo", async (req, res) => {
       return res.status(400).json({ error: "userEmail is required" });
     }
 
-    // Initialize Drive client
     const drive = await getDriveClientForUser(userEmail);
 
-    // 1) Get original file metadata
     console.log("Fetching file metadata for:", fileId);
     let metaResp;
     try {
@@ -250,11 +262,28 @@ functions.http("processVideo", async (req, res) => {
     const mp3Name = sourceName.endsWith(".mp4")
       ? sourceName.replace(/\.mp4$/i, ".mp3")
       : `${sourceName}.mp3`;
+    const sanitizedObjectName = sanitizeGcsObjectName(mp3Name);
 
-    // Early exit if the MP3 already exists
-    const existingMp3 = await findExistingMp3(drive, mp3Name, sourceParents);
-    if (existingMp3) {
-      console.log("Returning existing MP3 without reprocessing");
+    const bucketName = process.env.GCS_AUDIO_BUCKET;
+    if (!bucketName) {
+      throw new Error("GCS_AUDIO_BUCKET environment variable is required");
+    }
+
+    console.log("Target Cloud Storage bucket:", bucketName);
+    const storage = await getStorageClient();
+    const bucket = storage.bucket(bucketName);
+    const objectName = sanitizedObjectName;
+    console.log("Target Cloud Storage object:", objectName);
+
+    const gcsFile = bucket.file(objectName);
+    let gcsMetadata;
+    const [alreadyExists] = await gcsFile.exists();
+    if (alreadyExists) {
+      console.log(
+        "Existing MP3 found in Cloud Storage bucket. Skipping conversion."
+      );
+      [gcsMetadata] = await gcsFile.getMetadata();
+
       return res.status(200).json({
         status: "ok",
         actingUser: userEmail,
@@ -263,12 +292,11 @@ functions.http("processVideo", async (req, res) => {
           name: sourceName,
           parents: sourceParents,
         },
-        audioFile: existingMp3,
+        audioFile: buildGcsAudioResponse(bucketName, objectName, gcsMetadata),
         reused: true,
       });
     }
 
-    // 2) Download video file
     console.log("Downloading file bytes for:", fileId);
     let downloadResp;
     try {
@@ -285,7 +313,6 @@ functions.http("processVideo", async (req, res) => {
 
     const videoBuffer = Buffer.from(downloadResp.data);
 
-    // 3) Save MP4 to /tmp
     const inputPath = path.join(TMP_DIR, `input-${fileId}.mp4`);
     const outputPath = path.join(TMP_DIR, `output-${fileId}.mp3`);
     console.log("Writing MP4 to:", inputPath);
@@ -298,12 +325,10 @@ functions.http("processVideo", async (req, res) => {
       throw err;
     }
 
-    // 4) Convert via ffmpeg
     console.log("Calling convertToMp3...");
     await convertToMp3(inputPath, outputPath);
     console.log("MP3 created:", outputPath);
 
-    // 5) Read MP3 back
     console.log("Reading MP3 from:", outputPath);
     let audioBuffer;
     try {
@@ -314,38 +339,25 @@ functions.http("processVideo", async (req, res) => {
       throw err;
     }
 
-    // 6) Prepare metadata for upload
-    console.log("MP3 upload name:", mp3Name);
-    console.log("Uploading into parents:", sourceParents);
-
-    const fileMetadata = {
-      name: mp3Name,
-      mimeType: "audio/mpeg",
-      ...(sourceParents.length > 0 ? { parents: sourceParents } : {}),
-    };
-
-    const media = {
-      mimeType: "audio/mpeg",
-      body: bufferToStream(audioBuffer),
-    };
-
-    // 7) Upload MP3
-    console.log("Uploading MP3 to Drive...");
-    let uploadResp;
+    console.log("Uploading MP3 to Cloud Storage bucket:", bucketName);
     try {
-      uploadResp = await drive.files.create({
-        requestBody: fileMetadata,
-        media,
-        fields: "id,name,parents,webViewLink,webContentLink",
+      await gcsFile.save(audioBuffer, {
+        resumable: false,
+        contentType: "audio/mpeg",
+        metadata: {
+          metadata: {
+            sourceFileId: fileId,
+            sourceFileName: sourceName,
+          },
+        },
       });
+      [gcsMetadata] = await gcsFile.getMetadata();
+      console.log("Cloud Storage upload completed:", gcsMetadata?.name);
     } catch (err) {
-      console.error("Drive API Error (uploading MP3):", err);
+      console.error("Cloud Storage Error (uploading MP3):", err);
       throw err;
     }
 
-    console.log("Upload completed:", uploadResp.data);
-
-    // 8) Cleanup temp files
     console.log("Cleaning up temp files in:", TMP_DIR);
 
     try {
@@ -356,7 +368,6 @@ functions.http("processVideo", async (req, res) => {
       console.warn("Cleanup error:", e.message);
     }
 
-    // Send success
     console.log("Returning success response");
     return res.status(200).json({
       status: "ok",
@@ -366,7 +377,7 @@ functions.http("processVideo", async (req, res) => {
         name: sourceName,
         parents: sourceParents,
       },
-      audioFile: uploadResp.data,
+      audioFile: buildGcsAudioResponse(bucketName, objectName, gcsMetadata),
     });
   } catch (err) {
     console.error("FATAL ERROR in processVideo():", err);
