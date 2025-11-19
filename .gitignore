@@ -1,5 +1,6 @@
 /node_modules
 sa-key.json
 *.http
-.env
+*.env
 .env.local
+service-account.json
