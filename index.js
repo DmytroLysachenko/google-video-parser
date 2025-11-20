@@ -137,11 +137,11 @@ functions.http("processVideo", async (req, res) => {
     let gcsMetadata;
     const [alreadyExists] = await gcsFile.exists();
     if (alreadyExists) {
+      [gcsMetadata] = await gcsFile.getMetadata();
       console.info("[processVideo] Existing MP3 found, skipping conversion");
       logVerbose(
         "Existing MP3 found in Cloud Storage bucket. Skipping conversion."
       );
-      [gcsMetadata] = await gcsFile.getMetadata();
 
       return res.status(200).json({
         status: "ok",
