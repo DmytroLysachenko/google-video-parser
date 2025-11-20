@@ -121,6 +121,7 @@ functions.http("processVideo", async (req, res) => {
       ? sourceName.replace(/\.mp4$/i, ".mp3")
       : `${sourceName}.mp3`;
     const sanitizedObjectName = sanitizeGcsObjectName(mp3Name);
+    const audioObjectName = `meetings_audio/${sanitizedObjectName}`;
 
     const bucketName = process.env.GCS_AUDIO_BUCKET;
     if (!bucketName) {
@@ -130,7 +131,7 @@ functions.http("processVideo", async (req, res) => {
     logVerbose("Target Cloud Storage bucket:", bucketName);
     const storage = await getStorageClient();
     const bucket = storage.bucket(bucketName);
-    const objectName = sanitizedObjectName;
+    const objectName = audioObjectName;
     logVerbose("Target Cloud Storage object:", objectName);
 
     const gcsFile = bucket.file(objectName);
@@ -146,11 +147,6 @@ functions.http("processVideo", async (req, res) => {
       return res.status(200).json({
         status: "ok",
         actingUser: userEmail,
-        originalFile: {
-          id: fileId,
-          name: sourceName,
-          parents: sourceParents,
-        },
         audioFile: buildGcsAudioResponse(bucketName, objectName, gcsMetadata),
         reused: true,
       });
@@ -192,11 +188,6 @@ functions.http("processVideo", async (req, res) => {
     return res.status(200).json({
       status: "ok",
       actingUser: userEmail,
-      originalFile: {
-        id: fileId,
-        name: sourceName,
-        parents: sourceParents,
-      },
       audioFile: buildGcsAudioResponse(bucketName, objectName, gcsMetadata),
     });
   } catch (err) {
