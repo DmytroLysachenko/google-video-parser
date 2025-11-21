@@ -51,7 +51,6 @@ functions.http("processVideo", async (req, res) => {
     body: req.body,
   });
 
-  console.info("[processVideo] Request received");
   let jobAcquired = false;
 
   try {
@@ -72,9 +71,7 @@ functions.http("processVideo", async (req, res) => {
       return res.status(400).json({ error: "userEmail is required" });
     }
 
-    console.info(
-      `[processVideo] Validated request for file ${fileId} by ${userEmail}`
-    );
+    console.info("[processVideo] Start", { fileId, userEmail });
 
     if (!hasAvailableJobSlot()) {
       console.warn(
@@ -111,7 +108,6 @@ functions.http("processVideo", async (req, res) => {
       throw err;
     }
 
-    console.info("[processVideo] Retrieved Drive metadata");
     logVerbose("File metadata:", metaResp.data);
 
     const sourceName = metaResp.data.name || fileId;
@@ -139,11 +135,14 @@ functions.http("processVideo", async (req, res) => {
     const [alreadyExists] = await gcsFile.exists();
     if (alreadyExists) {
       [gcsMetadata] = await gcsFile.getMetadata();
-      console.info("[processVideo] Existing MP3 found, skipping conversion");
       logVerbose(
         "Existing MP3 found in Cloud Storage bucket. Skipping conversion."
       );
 
+      console.info("[processVideo] Reused existing audio", {
+        fileId,
+        object: objectName,
+      });
       return res.status(200).json({
         status: "ok",
         actingUser: userEmail,
@@ -152,7 +151,6 @@ functions.http("processVideo", async (req, res) => {
       });
     }
 
-    console.info("[processVideo] Starting download and conversion pipeline");
     logVerbose("Downloading file bytes for:", fileId);
     let downloadResp;
     try {
@@ -180,11 +178,12 @@ functions.http("processVideo", async (req, res) => {
       throw err;
     }
 
-    console.info("[processVideo] Conversion complete, responding to client");
-    logVerbose(
-      "Returning success response. RSS after job:",
-      `${getMemoryUsageMb().toFixed(1)}MB`
-    );
+    const rssMb = getMemoryUsageMb().toFixed(1);
+    console.info("[processVideo] Completed", {
+      fileId,
+      object: objectName,
+      rssMb,
+    });
     return res.status(200).json({
       status: "ok",
       actingUser: userEmail,
